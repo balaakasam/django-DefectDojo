@@ -40,8 +40,6 @@ from dojo.api_v2.views import (
     AppAnalysisViewSet,
     BurpRawRequestResponseViewSet,
     ConfigurationPermissionViewSet,
-    CredentialsMappingViewSet,
-    CredentialsViewSet,
     DevelopmentEnvironmentViewSet,
     DojoGroupMemberViewSet,
     DojoGroupViewSet,
@@ -60,8 +58,6 @@ from dojo.api_v2.views import (
     LanguageViewSet,
     NotesViewSet,
     NoteTypeViewSet,
-    NotificationsViewSet,
-    NotificationWebhooksViewSet,
     ProductAPIScanConfigurationViewSet,
     ProductGroupViewSet,
     ProductMemberViewSet,
@@ -69,15 +65,9 @@ from dojo.api_v2.views import (
     ProductTypeMemberViewSet,
     ProductTypeViewSet,
     ProductViewSet,
-    QuestionnaireAnsweredSurveyViewSet,
-    QuestionnaireAnswerViewSet,
-    QuestionnaireEngagementSurveyViewSet,
-    QuestionnaireGeneralSurveyViewSet,
-    QuestionnaireQuestionViewSet,
     RiskAcceptanceViewSet,
     RoleViewSet,
     SonarqubeIssueViewSet,
-    StubFindingsViewSet,
     TestsViewSet,
     TestTypesViewSet,
     ToolConfigurationsViewSet,
@@ -98,13 +88,8 @@ from dojo.location.api.views import LocationFindingReferenceViewSet, LocationPro
 from dojo.location.models import Location, LocationFindingReference, LocationProductReference
 from dojo.models import (
     Announcement,
-    Answered_Survey,
     App_Analysis,
     BurpRawRequestResponse,
-    ChoiceAnswer,
-    ChoiceQuestion,
-    Cred_Mapping,
-    Cred_User,
     Development_Environment,
     Dojo_Group,
     Dojo_Group_Member,
@@ -112,11 +97,9 @@ from dojo.models import (
     Endpoint,
     Endpoint_Status,
     Engagement,
-    Engagement_Survey,
     FileUpload,
     Finding,
     Finding_Template,
-    General_Survey,
     Global_Role,
     JIRA_Instance,
     JIRA_Issue,
@@ -138,17 +121,15 @@ from dojo.models import (
     Role,
     Sonarqube_Issue,
     Sonarqube_Issue_Transition,
-    Stub_Finding,
     Test,
     Test_Type,
-    TextAnswer,
-    TextQuestion,
     Tool_Configuration,
     Tool_Product_Settings,
     Tool_Type,
     User,
     UserContactInfo,
 )
+from dojo.notifications.api.views import NotificationsViewSet, NotificationWebhooksViewSet
 from dojo.organization.api.views import (
     OrganizationGroupViewSet,
     OrganizationMemberViewSet,
@@ -1002,8 +983,8 @@ class FindingCloseAPITest(DojoAPITestCase):
 
     def test_close_finding_pushes_note_to_jira_when_configured(self):
         finding = Finding.objects.get(id=7)
-        with patch("dojo.jira_link.helper.add_comment") as add_comment_mock, \
-             patch("dojo.jira_link.helper.is_push_all_issues", return_value=True), \
+        with patch("dojo.jira.helper.add_comment") as add_comment_mock, \
+             patch("dojo.jira.helper.is_push_all_issues", return_value=True), \
              patch.object(Finding, "has_jira_issue", new_callable=PropertyMock, return_value=True):
             payload = {
                 "is_mitigated": True,
@@ -1685,7 +1666,9 @@ class EngagementTest(BaseClass.RelatedObjectsTest, BaseClass.BaseClassTest):
         self.permission_create = Permissions.Engagement_Add
         self.permission_update = Permissions.Engagement_Edit
         self.permission_delete = Permissions.Engagement_Delete
-        self.deleted_objects = 23
+        # 23 -> 21: cascading delete no longer pulls 2 Stub_Finding rows now
+        # that the model has been removed.
+        self.deleted_objects = 21
         BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
 
 
@@ -2519,38 +2502,6 @@ class AssetTest(BaseClass.BaseClassTest):
 
 
 @versioned_fixtures
-class StubFindingsTest(BaseClass.BaseClassTest):
-    fixtures = ["dojo_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = Stub_Finding
-        self.endpoint_path = "stub_findings"
-        self.viewname = "stub_finding"
-        self.viewset = StubFindingsViewSet
-        self.payload = {
-            "title": "Stub Finding 1",
-            "date": "2017-12-31",
-            "severity": "High",
-            "description": "test stub finding",
-            "reporter": 3,
-            "test": 3,
-        }
-        self.update_fields = {"severity": "Low"}
-        self.test_type = TestType.OBJECT_PERMISSIONS
-        self.permission_check_class = Stub_Finding
-        self.permission_create = Permissions.Finding_Add
-        self.permission_update = Permissions.Finding_Edit
-        self.permission_delete = Permissions.Finding_Delete
-        self.deleted_objects = 1
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-    def test_severity_validation(self):
-        result = self.client.patch(self.url + "2/", data={"severity": "Not a valid choice"})
-        self.assertEqual(result.status_code, status.HTTP_400_BAD_REQUEST, "Severity just got set to something invalid")
-        self.assertEqual(result.json()["severity"], ["Severity must be one of the following: ['Info', 'Low', 'Medium', 'High', 'Critical']"])
-
-
-@versioned_fixtures
 class TestsTest(BaseClass.RelatedObjectsTest, BaseClass.BaseClassTest):
     fixtures = ["dojo_testdata.json"]
 
@@ -2718,7 +2669,7 @@ class UsersTest(BaseClass.BaseClassTest):
         }
         self.update_fields = {"first_name": "test changed", "configuration_permissions": [219, 220]}
         self.test_type = TestType.CONFIGURATION_PERMISSIONS
-        self.deleted_objects = 25
+        self.deleted_objects = 13
         BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
 
     def test_create(self):
@@ -3426,6 +3377,95 @@ class ReimportScanTest(DojoAPITestCase):
             mock.assert_called_with(User.objects.get(username="admin"),
                 Test.objects.get(id=4),  # test id found via product name and engagement name and scan_type and test_title
                 Permissions.Import_Scan_Result)
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
+    # Security tests: verify that conflicting ID-based and name-based identifiers are rejected
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    @patch("dojo.api_v2.permissions.user_has_permission")
+    def test_reimport_engagement_param_ignored_permission_checked_on_name_resolved_target(self, mock, importer_mock, reimporter_mock):
+        """
+        Engagement is not a declared field on ReImportScanSerializer — verify
+        the permission check uses the name-resolved target, not the engagement param.
+        """
+        mock.return_value = False
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # engagement=1 belongs to Product 2 Engagement 1, but it should be ignored
+                "engagement": 1,
+                # These names resolve to Product 2's Engagement 4 -> Test 4
+                "product_name": "Security How-to",
+                "engagement_name": "April monthly engagement",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(403, response.status_code, response.content[:1000])
+            # Permission must be checked on name-resolved Test 4 (in Engagement 4),
+            # NOT on Test 3 (which belongs to the engagement=1 param)
+            mock.assert_called_with(User.objects.get(username="admin"),
+                Test.objects.get(id=4),
+                Permissions.Import_Scan_Result)
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    def test_reimport_with_test_id_mismatched_product_name_is_rejected(self, importer_mock, reimporter_mock):
+        """Sending test ID from one product with product_name from another must be rejected."""
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # Test 3 belongs to Engagement 1 -> Product 2 ("Security How-to")
+                "test": 3,
+                # But product_name points to Product 1 ("Python How-to")
+                "product_name": "Python How-to",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(400, response.status_code, response.content[:1000])
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    def test_reimport_with_test_id_mismatched_engagement_name_is_rejected(self, importer_mock, reimporter_mock):
+        """Sending test ID from one engagement with engagement_name from another must be rejected."""
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # Test 3 belongs to Engagement 1 ("1st Quarter Engagement")
+                "test": 3,
+                # But engagement_name points to a different engagement
+                "product_name": "Security How-to",
+                "engagement_name": "April monthly engagement",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(400, response.status_code, response.content[:1000])
             importer_mock.assert_not_called()
             reimporter_mock.assert_not_called()
 
@@ -4197,149 +4237,6 @@ class ConfigurationPermissionTest(BaseClass.BaseClassTest):
         self.viewname = "permission"
         self.viewset = ConfigurationPermissionViewSet
         self.test_type = TestType.STANDARD
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-@versioned_fixtures
-class CredentialMappingTest(BaseClass.BaseClassTest):
-    fixtures = ["dojo_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = Cred_Mapping
-        self.endpoint_path = "credential_mappings"
-        self.viewname = "cred_mapping"
-        self.viewset = CredentialsMappingViewSet
-        self.payload = {
-            "cred_id": 1,
-            "product": 1,
-            "url": "https://google.com",
-        }
-        self.update_fields = {"url": "https://bing.com"}
-        self.test_type = TestType.OBJECT_PERMISSIONS
-        self.permission_check_class = Product
-        self.permission_create = Permissions.Credential_Add
-        self.permission_update = Permissions.Credential_Edit
-        self.permission_delete = Permissions.Credential_Delete
-        self.deleted_objects = 1
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-@versioned_fixtures
-class CredentialTest(BaseClass.BaseClassTest):
-    fixtures = ["dojo_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = Cred_User
-        self.endpoint_path = "credentials"
-        self.viewname = "cred_user"
-        self.viewset = CredentialsViewSet
-        self.payload = {
-            "name": "name",
-            "username": "usernmae",
-            "password": "password",
-            "role": "role",
-            "url": "https://some-url.com",
-            "environment": 1,
-        }
-        self.update_fields = {"name": "newname"}
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 2
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class TextQuestionTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = TextQuestion
-        self.endpoint_path = "questionnaire_questions"
-        self.viewname = "question"
-        self.viewset = QuestionnaireQuestionViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class ChoiceQuestionTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = ChoiceQuestion
-        self.endpoint_path = "questionnaire_questions"
-        self.viewname = "question"
-        self.viewset = QuestionnaireQuestionViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class TextAnswerTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = TextAnswer
-        self.endpoint_path = "questionnaire_answers"
-        self.viewname = "answer"
-        self.viewset = QuestionnaireAnswerViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class ChoiceAnswerTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = ChoiceAnswer
-        self.endpoint_path = "questionnaire_answers"
-        self.viewname = "answer"
-        self.viewset = QuestionnaireAnswerViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class GeneralSurveyTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = General_Survey
-        self.endpoint_path = "questionnaire_general_questionnaires"
-        self.viewname = "general_survey"
-        self.viewset = QuestionnaireGeneralSurveyViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-
-class EngagementSurveyTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = Engagement_Survey
-        self.endpoint_path = "questionnaire_engagement_questionnaires"
-        self.viewname = "engagement_survey"
-        self.viewset = QuestionnaireEngagementSurveyViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
-        BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
-
-    def test_link_engagement_questionnaire(self):
-        end_url = self.url + "4/link_engagement/2/"
-        result = self.client.post(end_url)
-        self.assertEqual(result.status_code, status.HTTP_200_OK, f"Failed to link enagement survey to engagement: {result.content} on {end_url}")
-
-
-class AnsweredSurveyTest(BaseClass.BaseClassTest):
-    fixtures = ["questionnaire_testdata.json"]
-
-    def __init__(self, *args, **kwargs):
-        self.endpoint_model = Answered_Survey
-        self.endpoint_path = "questionnaire_answered_questionnaires"
-        self.viewname = "answered_survey"
-        self.viewset = QuestionnaireAnsweredSurveyViewSet
-        self.test_type = TestType.STANDARD
-        self.deleted_objects = 5
         BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
 
 
